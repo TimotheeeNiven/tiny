@@ -4,6 +4,7 @@ import time
 import yaml
 import numpy as np
 from sklearn.metrics import roc_auc_score
+from collections import Counter
 
 from datasets import DataSet
 from device_manager import DeviceManager
@@ -105,39 +106,71 @@ def parse_test_script(test_script):
     with open(test_script) as test_file:
         return yaml.load(test_file, Loader=yaml.CLoader)
 
-def normalize_probabilities(probabilities):
-    """Normalize probabilities to ensure they sum to 1.0, no matter the initial sum."""
-    probabilities = np.array(probabilities)
-    sum_probs = np.sum(probabilities)
-    
-    # Ensure probabilities sum exactly to 1
-    if sum_probs == 0:
-        raise ValueError("Sum of probabilities is zero, cannot normalize.")
-    
-    probabilities = probabilities / sum_probs  # Normalize probabilities to make sum = 1
-    
-    return probabilities
+# Function to normalize probabilities
+def normalize_probabilities(scores):
+    total = sum(scores)
+    return [s / total for s in scores]
 
-from collections import Counter
-import numpy as np
-from sklearn.metrics import roc_auc_score
+# Function to calculate accuracy
+def calculate_accuracy(y_pred, labels):
+    y_pred = (y_pred - y_pred.min(axis=0)) / (y_pred.max(axis=0) - y_pred.min(axis=0) + 1e-10)
+    y_pred = np.array([[value, 1- value] for value in y_pred])
+    y_pred_label = np.argmax(y_pred, axis=1)
+    correct = np.sum(labels == y_pred_label)
+    accuracy = 100 * correct / len(y_pred)
+    print(f"Overall accuracy = {accuracy:2.1f}")
+    return accuracy
 
+# Function to calculate AUC
+def calculate_auc(y_pred, labels, n_classes):
+    # Normalize y_pred for each class
+    y_pred = (y_pred - y_pred.min(axis=0)) / (y_pred.max(axis=0) - y_pred.min(axis=0) + 1e-10)
+    y_pred = np.array([[value, 1- value] for value in y_pred])
+    thresholds = np.arange(0.0, 1.01, 0.01)
+    fpr = np.zeros([n_classes, len(thresholds)])
+    tpr = np.zeros([n_classes, len(thresholds)])
+    roc_auc = np.zeros(n_classes)
+    
+    for class_item in range(n_classes):
+        all_positives = sum(labels == class_item)
+        all_negatives = len(labels) - all_positives
+
+        for threshold_item in range(1, len(thresholds)):
+            threshold = thresholds[threshold_item]
+            false_positives = 0
+            true_positives = 0
+            for i in range(len(y_pred)):
+                if y_pred[i, class_item] > threshold:
+                    if labels[i] == class_item:
+                        true_positives += 1
+                    else:
+                        false_positives += 1
+            fpr[class_item, threshold_item] = false_positives / float(all_negatives)
+            tpr[class_item, threshold_item] = true_positives / float(all_positives)
+
+        fpr[class_item, 0] = 1
+        tpr[class_item, 0] = 1
+        for threshold_item in range(len(thresholds) - 1):
+            roc_auc[class_item] += 0.5 * (tpr[class_item, threshold_item] + tpr[class_item, threshold_item + 1]) * (
+                        fpr[class_item, threshold_item] - fpr[class_item, threshold_item + 1])
+
+    roc_auc_avg = np.mean(roc_auc)
+    print(f"Simplified average ROC AUC = {roc_auc_avg:.3f}")
+    return roc_auc
+
+
+# Summarize results
 def summarize_result(result):
-    """
-    Summarizes results based on mode:
-    - 'a' : Accuracy and AUC calculations
-    - 'p' : Performance metrics like runtime and throughput
-    - 'e' : Reserved for energy calculations (to be implemented)
-    """
-    # Initialize counters and storage for results
-    num_correct_files = 0  # Correct files (not individual predictions)
-    total_files = 0  # Total number of files processed
+    num_correct_files = 0
+    total_files = 0
     true_labels = []
     predicted_probabilities = []
-    file_names = []
 
-    # Create a dictionary to aggregate results by file name
     file_infer_results = {}
+
+    # Extract all unique classes
+    all_classes = sorted(list(set(int(r['class']) for r in result)))
+    n_classes = len(all_classes)
 
     for r in result:
         infer_results = r['infer']['results']
@@ -146,71 +179,39 @@ def summarize_result(result):
 
         if file_name not in file_infer_results:
             file_infer_results[file_name] = {'true_class': true_class, 'results': []}
-        
-        # If there is only one inference result, we'll collect them for majority voting
+
         if len(infer_results) == 1:
-            class_label = 0 if infer_results[0] > 10 else 1
-            infer_results = [class_label, 1 - class_label]  # Two-class probability setup
-            # Add to the dictionary under the file name key
             file_infer_results[file_name]['results'].append(infer_results)
         else:
             infer_results = normalize_probabilities(infer_results)
-            # Add to the list for AUC calculation
             file_infer_results[file_name]['results'].append(infer_results)
 
-    # Process the aggregated results and determine the class for each file
+    y_pred = []
+    y_true = []
+
     for file_name, data in file_infer_results.items():
         true_class = data['true_class']
         results = data['results']
 
-        # Count occurrences of class predictions
         class_counts = Counter([np.argmax(res) for res in results])
-        
-        # Determine the majority class
-        majority_class = class_counts.most_common(1)[0][0]  # Get the most frequent class
-        
-        # Increment num_correct_files if the majority class matches the true class
+        majority_class = class_counts.most_common(1)[0][0]
+
         if majority_class == true_class:
             num_correct_files += 1
-        
-        # Store true label and predicted probabilities for AUC calculation
-        true_labels.append(true_class)
-        predicted_probabilities.append(results[0])  # Use the first probability set for AUC
 
-        # Increment total_files processed
+        averaged_result = np.mean(results, axis=0)
+        y_pred.append(averaged_result)
+        y_true.append(true_class)
+
         total_files += 1
 
-    # Convert lists to numpy arrays for AUC calculation
-    true_labels = np.array(true_labels)
-    predicted_probabilities = np.array(predicted_probabilities)
+    accuracy = calculate_accuracy(np.array(y_pred), np.array(y_true))
+    auc = calculate_auc(np.array(y_pred), np.array(y_true), n_classes)
 
-    # Accuracy calculation based on files, not individual results
-    accuracy = num_correct_files / total_files
-    print(f"Accuracy = {num_correct_files}/{total_files} = {100*accuracy:4.2f}%")   
+    print(f"File-based accuracy = {accuracy:.2f}")
+    print(f"AUC = {auc}")
 
-    # Check if binary classification (i.e., only two unique classes)
-    if len(np.unique(true_labels)) == 2:
-        # For binary classification, use the probability of class 1
-        predicted_probabilities = predicted_probabilities[:, 1].reshape(-1, 1)  # Use class 1 probability
-
-        # Compute AUC for binary classification (class 1)
-        try:
-            auc_score = roc_auc_score(true_labels, predicted_probabilities)
-            print(f"AUC: {auc_score:.4f}")
-        except ValueError as e:
-            print(f"AUC calculation failed: {e}")
-    else:
-        # Multiclass AUC calculation
-        try:
-            # Use the one-vs-rest approach for AUC calculation
-            auc_score = roc_auc_score(
-                true_labels, 
-                predicted_probabilities, 
-                multi_class='ovr'
-            )
-            print(f"Multiclass AUC (One-vs-Rest): {auc_score:.4f}")
-        except ValueError as e:
-            print(f"Multiclass AUC calculation failed: {e}")
+    return accuracy, auc
 
               
 if __name__ == '__main__':
